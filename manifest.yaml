@@ -1,0 +1,11 @@
+version: v1alpha1
+metadata:
+  name: lxd-agent
+  version: 0.1.0
+  author: Daniel Booth
+  description: |
+    Experimental Talos extension that starts the host-supplied LXD VM guest
+    agent and exposes the DevLXD socket required by the Canonical LXD CSI driver.
+  compatibility:
+    talos:
+      version: ">= v1.13.0"

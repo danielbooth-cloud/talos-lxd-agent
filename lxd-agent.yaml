@@ -1,0 +1,26 @@
+name: lxd-agent
+depends:
+  - service: cri
+container:
+  entrypoint: ./lxd-agent-loader
+  security:
+    maskedPaths: []
+    readonlyPaths: []
+    rootfsPropagation: rshared
+  mounts:
+    - source: /dev
+      destination: /dev
+      type: bind
+      options:
+        - rshared
+        - rbind
+        - rw
+    - source: /run
+      destination: /run
+      type: bind
+      options:
+        - rshared
+        - rbind
+        - rw
+restart: always
+logToConsole: true
