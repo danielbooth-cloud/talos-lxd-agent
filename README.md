@@ -1,5 +1,13 @@
 # talos-lxd-agent (experimental)
 
+> [!WARNING]
+> **AI-assisted development.** This extension was produced through heavy
+> AI-assisted development with limited human review. It installs a
+> root-equivalent Talos extension service that bind-mounts host `/dev` and
+> `/run` read-write and mounts a shared tmpfs on `/mnt`. Read the code,
+> test it on a non-production node first, and treat it as experimental
+> software. No warranty of fitness for any purpose is provided.
+
 A custom [Talos Linux system extension](https://docs.siderolabs.com/talos/v1.13/build-and-extend-talos/custom-images-and-development/extension-services/)
 that runs LXD's VM guest agent (`lxd-agent`) on Talos, creating the `/dev/lxd/sock`
 DevLXD socket required by the [Canonical LXD CSI driver](https://github.com/canonical/lxd-csi-driver).
@@ -16,12 +24,16 @@ for standard systemd guests.
 The extension deploys one Talos extension service (`ext-lxd-agent`) whose
 container runs a small static Go loader (`cmd/lxd-agent-loader`):
 
-1. Mounts a tmpfs on `/mnt` with shared propagation (see below).
+1. Creates `/mnt` if it is missing (the scratch-based service rootfs ships
+   none) and mounts a tmpfs on it with shared propagation (see below).
 2. Mounts LXD's `config` share (tag `config`) at `/run/lxd_agent/.mnt`
    using virtiofs, falling back to 9p.
 3. Copies the share contents (agent binary, agent.conf, certificates) into
    `/run/lxd_agent`, then unmounts and removes the mountpoint.
-4. Verifies `/run/lxd_agent/lxd-agent` exists and is executable.
+4. Verifies `/run/lxd_agent/lxd-agent` exists, is executable, and is
+   statically linked (the scratch container has no dynamic loader; official
+   LXD builds the agent statically, and a dynamic one fails loudly with an
+   explanation instead of a bare exec error).
 5. `chdir`s to `/run/lxd_agent` (the agent expects `agent.conf` in its working
    directory) and `exec`s the host-supplied `lxd-agent` binary.
 
@@ -55,11 +67,17 @@ Bidirectional`) pick them up. No `UserVolumeConfig` or
   (`security.devlxd.management.volumes=true` on every Kubernetes VM) and the
   `auth_bearer_devlxd` extension (LXD 6.6+, or a 5.21.x build that ships
   both extensions) for CSI authorization.
+- `virtiofsd` available to the LXD host: LXD serves the VM config drive
+  over virtiofs when it can and falls back to 9p otherwise. Talos kernels
+  ship no 9p support, so the 9p fallback leaves the agent unable to start.
 - The agent binary always comes from the LXD host, so LXD and agent versions
   stay in sync automatically.
 
 ## Security notes
 
+- **Review before use.** This codebase was developed with heavy AI
+  assistance; verify the loader logic and the `lxd-agent` trust model
+  yourself before running it anywhere that matters.
 - Extension services on Talos run with all grantable capabilities and share
   the host network namespace; this service additionally bind-mounts host
   `/dev` and `/run` read-write. Treat the extension like any other
@@ -128,12 +146,22 @@ normally.
 
 ## Troubleshooting
 
-- `lxd-agent-loader: mount LXD config share ...` loop: the VM's `config`
-  share is missing. Confirm the instance is managed by LXD and that
-  `security.devlxd` is not disabled; virtiofs requires the host to export
-  the share (LXD always does for VMs).
+- `mount LXD config share: virtiofs: invalid argument; 9p: no such device`:
+  no config share device is visible to the guest. LXD serves the config
+  drive over virtiofs when it can and falls back to 9p otherwise (it logs
+  "Cannot use virtio-fs for config drive, using 9p as a fallback", usually
+  because `virtiofsd` is not installed on the LXD host). Talos kernels ship
+  no 9p support, so the fallback cannot be mounted: install `virtiofsd` on
+  the LXD host and restart the VM, then confirm with `lxc warning list` on
+  the host and `talosctl -n <node> ls /sys/fs/virtio_fs` on the guest (the
+  device tag is `config`).
 - `host-supplied LXD agent ... is not executable`: the config share was
   empty or truncated; check LXD host logs.
+- `host-supplied LXD agent ... is dynamically linked (interpreter ...)`: the
+  binary LXD served in the config share needs a dynamic loader, which the
+  scratch container does not provide. Official LXD builds `lxd-agent`
+  statically (`CGO_ENABLED=0`, `-tags agent,netgo`), so this points at a
+  custom agent build on the LXD host; rebuild it with CGO disabled.
 - `/mnt is already mounted, reusing it` is normal on service restarts; the
   propagated tmpfs from the previous run is reused.
 - Certificate errors in agent logs after a LXD host upgrade: restart the

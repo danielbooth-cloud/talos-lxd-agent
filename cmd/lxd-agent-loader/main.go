@@ -82,11 +82,34 @@ func run() error {
 		return fmt.Errorf("host-supplied LXD agent %q is not executable", agentPath)
 	}
 
+	// The scratch-based container ships no dynamic loader, so a dynamically
+	// linked agent binary cannot be executed. Detect that case up front and
+	// explain it, instead of failing with a bare "no such file or directory"
+	// from execve. Official LXD builds the agent statically
+	// (CGO_ENABLED=0, -tags agent,netgo), so this should never trigger for
+	// a host-supplied agent.
+	interp, err := elfInterpreter(agentPath)
+	if err != nil {
+		return fmt.Errorf("inspect host-supplied LXD agent: %w", err)
+	}
+
+	if interp != "" {
+		return fmt.Errorf(
+			"host-supplied LXD agent %q is dynamically linked (interpreter %q); "+
+				"the container has no dynamic loader, so LXD must supply a statically linked agent",
+			agentPath, interp,
+		)
+	}
+
 	if err := os.Chdir(runtimeDir); err != nil {
 		return fmt.Errorf("change working directory to %q: %w", runtimeDir, err)
 	}
 
 	log.Printf("starting host-supplied LXD agent")
 
-	return syscall.Exec(agentPath, []string{agentPath}, os.Environ())
+	if err := syscall.Exec(agentPath, []string{agentPath}, os.Environ()); err != nil {
+		return fmt.Errorf("exec host-supplied LXD agent: %w", err)
+	}
+
+	return nil
 }

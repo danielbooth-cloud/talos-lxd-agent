@@ -7,6 +7,10 @@ container:
     maskedPaths: []
     readonlyPaths: []
     rootfsPropagation: rshared
+    # The loader creates /mnt in the service rootfs before mounting the
+    # shared tmpfs on it; Talos mounts extension service rootfses
+    # read-only in the container unless this is set.
+    writeableRootfs: true
   mounts:
     - source: /dev
       destination: /dev
