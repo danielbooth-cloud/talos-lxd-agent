@@ -1,0 +1,110 @@
+# Runs the host-supplied LXD guest agent as a Kubernetes DaemonSet.
+#
+# Why a DaemonSet and not the Talos extension service directly: Talos applies
+# its default seccomp profile to extension-service containers, and that profile
+# blocks socket(AF_VSOCK) with no capability escape hatch
+# (containerd contrib/seccomp: "Allow socket(2) for all address families
+# except AF_VSOCK and AF_ALG"). The lxd-agent must listen on vsock:8443 for
+# the LXD host to reach it, so it has to run where seccomp can be relaxed —
+# a pod can set seccompProfile: Unconfined; an extension service cannot.
+#
+# The Talos extension service (ext-lxd-agent) remains responsible for payload
+# preparation: it mounts LXD's config share and copies the agent binary,
+# agent.conf and certificates to /run/lxd_agent on the host. This DaemonSet
+# waits for that payload, copies it locally (the loader re-cleans that
+# directory on every restart), and execs the agent with the copy as its
+# working directory (the agent expects agent.conf in its cwd).
+#
+# After a LXD host upgrade (rotated agent certificates), refresh the payload
+# with: kubectl -n kube-system rollout restart ds/lxd-agent
+#
+# /dev is bind-mounted read-write so the DevLXD socket created by the agent
+# (/dev/lxd/sock) lands on the host devtmpfs, where the LXD CSI node plugin
+# picks it up via hostPath.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lxd-agent
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: lxd-agent
+    app.kubernetes.io/component: lxd-guest-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lxd-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lxd-agent
+        app.kubernetes.io/component: lxd-guest-agent
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+      containers:
+        - name: lxd-agent
+          image: busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              # /mnt must be a shared tmpfs: the agent creates /mnt/lxd-csi/<vol>
+              # mounts that must be visible on the host for the CSI driver.
+              # The Talos root fs is read-only, so this pod mounts the tmpfs
+              # itself — the /mnt volume below uses mountPropagation:
+              # Bidirectional, so mounts created here propagate to the host.
+              # (The ext-lxd-agent loader also mounts one inside its own
+              # namespace, but that does not reach the host.)
+              mount | grep -q "on /mnt type tmpfs" || {
+                echo "mounting shared tmpfs on /mnt"
+                mount -t tmpfs -o mode=0755 tmpfs /mnt
+              }
+              # The ext-lxd-agent service restarts in a loop and re-cleans
+              # /run/lxd_agent each pass, so copy the payload to a private
+              # directory before exec'ing to avoid racing the loader.
+              until [ -x /run/lxd_agent/lxd-agent ]; do
+                echo "waiting for LXD agent payload from ext-lxd-agent..."
+                sleep 2
+              done
+              rm -rf /payload
+              mkdir -p /payload
+              cp -a /run/lxd_agent/. /payload/
+              cd /payload
+              echo "starting host-supplied LXD agent"
+              exec ./lxd-agent
+          securityContext:
+            privileged: true
+            seccompProfile:
+              type: Unconfined
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: agent-payload
+              mountPath: /run/lxd_agent
+            - name: mnt
+              mountPath: /mnt
+              mountPropagation: Bidirectional
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: agent-payload
+          hostPath:
+            path: /run/lxd_agent
+            type: DirectoryOrCreate
+        - name: mnt
+          hostPath:
+            path: /mnt
+            type: Directory

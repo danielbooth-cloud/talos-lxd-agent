@@ -26,5 +26,8 @@ container:
         - rshared
         - rbind
         - rw
-restart: always
+# The loader only stages the agent payload (the lxd-agent DaemonSet runs
+# the binary); run once per boot, stop restarting after a successful run so
+# the service stays quiet instead of crash-looping.
+restart: untilSuccess
 logToConsole: true

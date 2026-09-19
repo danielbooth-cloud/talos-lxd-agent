@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/danielbooth-cloud/talos-lxd-agent/internal/payload"
 )
@@ -82,12 +81,12 @@ func run() error {
 		return fmt.Errorf("host-supplied LXD agent %q is not executable", agentPath)
 	}
 
-	// The scratch-based container ships no dynamic loader, so a dynamically
-	// linked agent binary cannot be executed. Detect that case up front and
-	// explain it, instead of failing with a bare "no such file or directory"
-	// from execve. Official LXD builds the agent statically
-	// (CGO_ENABLED=0, -tags agent,netgo), so this should never trigger for
-	// a host-supplied agent.
+	// The agent payload must be statically linked: neither the Talos host
+	// nor the lxd-agent DaemonSet image ships a dynamic loader. Official
+	// LXD builds the agent statically (CGO_ENABLED=0, -tags agent,netgo),
+	// so this should never trigger for a host-supplied agent; detect a
+	// dynamic one up front and explain it, instead of failing later with a
+	// bare "no such file or directory" from execve.
 	interp, err := elfInterpreter(agentPath)
 	if err != nil {
 		return fmt.Errorf("inspect host-supplied LXD agent: %w", err)
@@ -96,20 +95,18 @@ func run() error {
 	if interp != "" {
 		return fmt.Errorf(
 			"host-supplied LXD agent %q is dynamically linked (interpreter %q); "+
-				"the container has no dynamic loader, so LXD must supply a statically linked agent",
+				"no dynamic loader is available on the host or in the lxd-agent "+
+				"DaemonSet image, so LXD must supply a statically linked agent",
 			agentPath, interp,
 		)
 	}
 
-	if err := os.Chdir(runtimeDir); err != nil {
-		return fmt.Errorf("change working directory to %q: %w", runtimeDir, err)
-	}
-
-	log.Printf("starting host-supplied LXD agent")
-
-	if err := syscall.Exec(agentPath, []string{agentPath}, os.Environ()); err != nil {
-		return fmt.Errorf("exec host-supplied LXD agent: %w", err)
-	}
+	// The binary is intentionally not executed here: Talos applies its
+	// default seccomp profile to extension-service containers and that
+	// profile blocks socket(AF_VSOCK), which the agent needs to listen on
+	// (vsock:8443). The lxd-agent DaemonSet runs the staged payload as a
+	// privileged pod with seccompProfile: Unconfined.
+	log.Printf("agent payload staged at %s (executed by the lxd-agent DaemonSet)", runtimeDir)
 
 	return nil
 }

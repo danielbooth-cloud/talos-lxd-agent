@@ -34,8 +34,15 @@ container runs a small static Go loader (`cmd/lxd-agent-loader`):
    statically linked (the scratch container has no dynamic loader; official
    LXD builds the agent statically, and a dynamic one fails loudly with an
    explanation instead of a bare exec error).
-5. `chdir`s to `/run/lxd_agent` (the agent expects `agent.conf` in its working
-   directory) and `exec`s the host-supplied `lxd-agent` binary.
+5. Logs that the payload is staged and exits (`restart: untilSuccess` keeps
+   the service quiet afterwards). The binary is intentionally *not* executed
+   here: Talos applies its default seccomp profile to extension-service
+   containers, and that profile blocks `socket(AF_VSOCK)`, which the agent
+   needs in order to listen on vsock:8443 — and extension specs have no
+   seccomp override. The **lxd-agent DaemonSet**
+   (`deploy/lxd-agent-daemonset.yaml`, deployed via the `lxd-agent` helmfile
+   component) runs the staged payload as a privileged pod with
+   `seccompProfile: Unconfined`.
 
 The service mounts host `/dev` and `/run` read-write with `rshared`
 propagation, so:
@@ -50,13 +57,18 @@ propagation, so:
 
 The Talos root filesystem is read-only, so `/mnt/lxd-csi/<volume>` (the path
 the CSI driver hardcodes for filesystem volumes) cannot be created on the
-host directly. The service root is shared-propagated, so a tmpfs mounted at
-`/mnt` inside the service's mount namespace propagates to the host. The
+host directly. The **lxd-agent DaemonSet pod** mounts a tmpfs on `/mnt`: its
+`/mnt` volume uses `mountPropagation: Bidirectional`, so mounts created
+inside the pod propagate to the host, where the kubelet and the CSI node
+plugin (hostPath with `mountPropagation: Bidirectional`) pick them up. The
 agent then creates `/mnt/lxd-csi/<volume>` on that shared tmpfs and mounts
-LXD's virtiofs share there; those mounts propagate to the host, where the
-kubelet and the CSI node plugin (hostPath with `mountPropagation:
-Bidirectional`) pick them up. No `UserVolumeConfig` or
+LXD's virtiofs share there. No `UserVolumeConfig` or
 `machine.kubelet.extraMounts` are required.
+
+Note: the loader also mounts a tmpfs on `/mnt` inside the extension
+service's own namespace (kept for the agent to find a writable `/mnt` if it
+is ever exec'd there again), but that mount does **not** propagate to the
+host — the pod is what establishes the shared host-visible tmpfs.
 
 ## Requirements
 
@@ -134,13 +146,14 @@ node reboots once. Roll nodes one at a time.
 ## Verify
 
 ```sh
-talosctl -n <node-ip> service ext-lxd-agent
+talosctl -n <node-ip> service ext-lxd-agent   # STATE Finished once payload is staged
+kubectl -n kube-system logs -l app.kubernetes.io/name=lxd-agent --tail=1
+                                              # "starting host-supplied LXD agent"
 talosctl -n <node-ip> ls /dev/lxd/sock
-talosctl -n <node-ip> ls /mnt/lxd-csi   # created on first volume mount
+talosctl -n <node-ip> ls /mnt/lxd-csi         # created on first volume mount
 ```
 
-`talosctl service` should show `Running` and logs should end with
-`starting host-supplied LXD agent`. Once the socket exists, the LXD CSI
+Once the socket exists, the LXD CSI
 Helmfile component (`lxd-csi` in `ops-cluster-apps`) can be deployed
 normally.
 
@@ -164,16 +177,26 @@ normally.
   custom agent build on the LXD host; rebuild it with CGO disabled.
 - `/mnt is already mounted, reusing it` is normal on service restarts; the
   propagated tmpfs from the previous run is reused.
-- Certificate errors in agent logs after a LXD host upgrade: restart the
-  service (`talosctl -n <node> service ext-lxd-agent restart`) so the loader
-  re-copies the refreshed agent payload.
+- Certificate errors in agent logs after a LXD host upgrade: re-stage the
+  payload and restart the agent pods (`talosctl -n <node> service
+  ext-lxd-agent restart`, then `kubectl -n kube-system rollout restart
+  ds/lxd-agent`).
+- `listen vsock ... operation not permitted` in loader logs: an old image
+  still exec'ing the agent inside the extension container. Upgrade to a
+  loader that only stages the payload and make sure the lxd-agent DaemonSet
+  is deployed — the pod runs the agent with `seccompProfile: Unconfined`,
+  which extension containers cannot set.
+- `mounting shared tmpfs on /mnt` in lxd-agent pod logs (once per boot) is
+  normal: the pod establishes the shared tmpfs that volume mounts
+  propagate through.
 - The `/var/mnt/lxd-csi` directories found on the nodes are unused by this
   design (left over from earlier experiments) and can be removed.
 
 ## Repository layout
 
 ```text
-cmd/lxd-agent-loader/       loader entrypoint (mount + copy + exec)
+cmd/lxd-agent-loader/       loader entrypoint (mount + stage)
+deploy/lxd-agent-daemonset.yaml  DaemonSet that runs the staged payload
 internal/payload/           recursive copy/clean helpers + tests
 lxd-agent.yaml              Talos extension service spec
 manifest.yaml               extension metadata consumed by Talos
